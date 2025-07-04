@@ -1,0 +1,6 @@
+
+name = "trojan-worker-custom"
+type = "javascript"
+account_id = "your_account_id"
+workers_dev = true
+compatibility_date = "2022-05-03"
