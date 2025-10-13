@@ -1,0 +1,285 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+نسخهٔ کامل و اصلاح‌شده:
+- پارس مقاوم vless/vmess/trojan/ss
+- پینگ با ping3 + fallback به subprocess
+- ساخت fragment واقعی V2Ray/XRay
+- ذخیره JSON و نمایش جدول با rich
+"""
+
+import os, re, json, base64, subprocess, urllib.parse
+from typing import List, Dict, Any, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+try:
+    from ping3 import ping
+    from rich import print
+    from rich.table import Table
+    from rich.progress import Progress, SpinnerColumn, BarColumn, TimeRemainingColumn
+except Exception:
+    print("[red]Missing dependencies. Install: pip install ping3 rich[/red]")
+    raise
+
+# ---------------- Settings ----------------
+OUTPUT_FOLDER = "/storage/emulated/0/Download/almasi98"
+os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+MAX_THREADS = 20
+PING_COUNT = 3
+SUBPROCESS_PING_COUNT = 3
+
+# ---------------- Helpers ----------------
+def safe_b64_decode(s: str) -> Optional[bytes]:
+    if not isinstance(s, str): return None
+    s = s.strip().split("#", 1)[0].replace("\n","")
+    padding = (-len(s)) % 4
+    s += "=" * padding
+    try: return base64.urlsafe_b64decode(s)
+    except Exception:
+        try: return base64.b64decode(s)
+        except Exception: return None
+
+def extract_protocol(cfg: str) -> str:
+    if "://" in cfg: return cfg.split("://", 1)[0].lower()
+    return "unknown"
+
+def extract_host(cfg: str) -> Optional[str]:
+    try:
+        cfg = cfg.strip()
+        if cfg.startswith("ss://"):
+            body = cfg[5:].split("#",1)[0]
+            dec = safe_b64_decode(body)
+            if dec:
+                try:
+                    ds = dec.decode(errors="ignore")
+                    if "@" in ds: return ds.rsplit("@",1)[1].split(":",1)[0]
+                except: pass
+            if "@" in body: return body.rsplit("@",1)[1].split(":",1)[0]
+            return None
+        if cfg.startswith("vmess://"):
+            payload = cfg.split("://",1)[1]
+            dec = safe_b64_decode(payload)
+            if dec:
+                try:
+                    jobj = json.loads(dec.decode(errors="ignore"))
+                    return jobj.get("add") or jobj.get("address")
+                except: pass
+        m = re.search(r"@([^:/?#\s]+)", cfg)
+        if m: return m.group(1)
+        m2 = re.search(r"://([^:/?#\s]+)", cfg)
+        if m2: return m2.group(1)
+        m3 = re.search(r"(\d{1,3}(?:\.\d{1,3}){3})", cfg)
+        if m3: return m3.group(1)
+    except: return None
+    return None
+
+# ---------------- Ping functions ----------------
+def ping3_avg(host: str, samples: int = PING_COUNT, timeout: float = 1.0) -> Optional[float]:
+    results=[]
+    for _ in range(samples):
+        try:
+            r = ping(host, timeout=timeout, unit="ms")
+            if r is not None: results.append(r)
+        except: pass
+    if not results: return None
+    results.sort()
+    if len(results) > 2: results = results[1:-1]
+    return sum(results)/len(results)
+
+def ping_subprocess_avg(host: str, count: int = SUBPROCESS_PING_COUNT) -> Optional[float]:
+    try:
+        output = subprocess.check_output(
+            ["ping","-c",str(count),"-W","1",host],
+            stderr=subprocess.DEVNULL, timeout=count*2+2
+        ).decode(errors="ignore")
+        m = re.search(r"rtt min/avg/max/(?:mdev|stddev) = [\d.]+/([\d.]+)", output)
+        if m: return float(m.group(1))
+    except: return None
+    return None
+
+def measure_latency(host: str) -> Optional[float]:
+    if not host: return None
+    p3 = ping3_avg(host)
+    if p3 is not None: return p3
+    return ping_subprocess_avg(host)
+
+def classify_latency_val(ms: Optional[float]) -> str:
+    if ms is None: return "no_reply"
+    try: v=float(ms)
+    except: return "no_reply"
+    if v<100: return "excellent"
+    if v<200: return "good"
+    if v<350: return "warn"
+    return "bad"
+
+# ---------------- Parse Link ----------------
+def parse_link(cfg: str) -> Dict[str, Any]:
+    proto = extract_protocol(cfg)
+    raw = cfg
+    remark = cfg
+    params: Dict[str,Any]={}
+    user=""
+    host = extract_host(cfg) or ""
+    port=443
+    try:
+        main = cfg.split("://",1)[1] if "://" in cfg else cfg
+        if "#" in main: main, frag = main.split("#",1); remark=urllib.parse.unquote(frag) or remark
+        if proto=="vmess":
+            dec = safe_b64_decode(main.strip())
+            if dec:
+                try:
+                    jobj=json.loads(dec.decode(errors="ignore"))
+                    host=jobj.get("add") or jobj.get("address") or host
+                    port=int(jobj.get("port") or 443)
+                    user=jobj.get("id") or jobj.get("uuid") or user
+                    params={k:jobj[k] for k in ("net","type","path","host","tls","sni","serviceName") if k in jobj}
+                    return {"raw":raw,"protocol":"vmess","remark":remark,"user":user,"host":host,"port":port,"params":params}
+                except: pass
+        qstr=""
+        if "?" in main: before_q,qstr = main.split("?",1)
+        else: before_q=main
+        if "@" in before_q: user_part, host_port = before_q.split("@",1); user=user_part
+        else: host_port = before_q
+        host_port=host_port.strip()
+        if ":" in host_port: h,p_raw = host_port.split(":",1); host=h or host; m=re.match(r"(\d+)",p_raw); port=int(m.group(1)) if m else 443
+        else: host = host_port or host; port=443
+        if qstr: parsed_q=urllib.parse.parse_qs(qstr); params={k:v[0] for k,v in parsed_q.items() if v}
+    except: pass
+    return {"raw":raw,"protocol":proto,"remark":remark,"user":user,"host":host,"port":int(port),"params":params}
+
+# ---------------- Build Fragment ----------------
+def build_fragment(parsed: Dict[str, Any]) -> Dict[str, Any]:
+    proto=(parsed.get("protocol") or "unknown").lower()
+    host=parsed.get("host") or "0.0.0.0"
+    port=int(parsed.get("port") or 443)
+    user=parsed.get("user") or ""
+    params=parsed.get("params") or {}
+    remark=parsed.get("remark") or parsed.get("raw") or f"{proto}_{host}"
+    network=params.get("type") or params.get("net") or ("ws" if proto in ("vless","vmess","trojan") else "tcp")
+    security=params.get("security") or ("tls" if params.get("tls") in ("tls","true","1",True) else "none")
+    streamSettings={"network":network,"security":security,"sockopt":{"dialerProxy":"fragment"}}
+    if security in ("tls","xtls"):
+        streamSettings["tlsSettings"]={
+            "serverName":params.get("sni") or params.get("host") or host,
+            "fingerprint":params.get("fp","chrome"),
+            "alpn":[p.strip() for p in (params.get("alpn") or "").split(",") if p.strip()] or ["http/1.1"]
+        }
+    if network=="ws":
+        streamSettings["wsSettings"]={"path":params.get("path","/"),"headers":{"Host":params.get("host") or params.get("sni") or host}}
+    if network=="grpc":
+        streamSettings["grpcSettings"]={"serviceName":params.get("serviceName") or params.get("service",""),"multiMode":False}
+    if proto in ("vless","vmess"):
+        outbound={"tag":"proxy","protocol":proto,"settings":{"vnext":[{"address":host,"port":port,"users":[{"id":user or params.get("id",""),"encryption":params.get("encryption","none"),"flow":params.get("flow","")}]}]},"streamSettings":streamSettings}
+    elif proto=="trojan":
+        outbound={"tag":"proxy","protocol":"trojan","settings":{"servers":[{"address":host,"port":port,"password":user or params.get("password","")}]}, "streamSettings":streamSettings}
+    elif proto in ("ss","shadowsocks"):
+        method=params.get("method",params.get("encrypt","aes-128-gcm"))
+        pwd=user or params.get("password","")
+        outbound={"tag":"proxy","protocol":"shadowsocks","settings":{"servers":[{"address":host,"port":port,"method":method,"password":pwd}]},"streamSettings":{"network":network,"security":"none","sockopt":{"dialerProxy":"fragment"}}}
+    else:
+        outbound={"tag":"proxy","protocol":"freedom","settings":{}}
+    fragment={
+        "remarks":remark,
+        "log":{"loglevel":"warning","access":"","error":""},
+        "dns":{"servers":[{"address":"https://1.1.1.1/dns-query","tag":"remote-dns"},"1.1.1.1","8.8.8.8"],"queryStrategy":"UseIP"},
+        "inbounds":[{"port":10808,"protocol":"socks","settings":{"auth":"noauth","udp":True,"userLevel":8},"sniffing":{"destOverride":["http","tls"],"enabled":True,"routeOnly":True},"tag":"socks-in"},{"port":10853,"protocol":"dokodemo-door","settings":{"address":"1.1.1.1","network":"tcp,udp","port":53},"tag":"dns-in"}],
+        "outbounds":[outbound,{"tag":"fragment","protocol":"freedom","settings":{"fragment":{"packets":"tlshello","length":"100-200","interval":"1-1"},"domainStrategy":"UseIPv4v6"}},{"tag":"dns-out","protocol":"dns","settings":{}}],
+        "routing":{"domainStrategy":"IPIfNonMatch","rules":[{"inboundTag":["dns-in"],"outboundTag":"dns-out","type":"field"},{"network":"tcp","outboundTag":"proxy","type":"field"},{"network":"udp","outboundTag":"proxy","type":"field"}]}
+    }
+    return fragment
+
+# ---------------- Display & Save ----------------
+def display_ping_table(records: List[Dict[str,Any]]) -> None:
+    table=Table(title="Ping Results")
+    table.add_column("#",style="bold"); table.add_column("Protocol"); table.add_column("Host"); table.add_column("Latency (ms)"); table.add_column("Level")
+    counts={}
+    for i, rec in enumerate(records,1):
+        proto=rec.get("protocol","unknown").upper()
+        host=rec.get("host") or "-"
+        latency=rec.get("latency")
+        level=classify_latency_val(latency)
+        counts[level]=counts.get(level,0)+1
+        latency_str=f"{latency:.2f}" if isinstance(latency,(int,float)) else "No Reply"
+        table.add_row(str(i), proto, host, latency_str, level.upper())
+    print(table)
+    summary="  ".join([f"{k.upper()}: {counts.get(k,0)}" for k in ("excellent","good","warn","bad","no_reply")])
+    print("[cyan]"+summary+"[/cyan]")
+
+def save_fragments(fragments: List[Dict[str,Any]]) -> None:
+    os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+    fname=input("Enter output filename (without extension, default fragment): ").strip() or "fragment"
+    if not fname.lower().endswith(".json"): fname+= ".json"
+    path=os.path.join(OUTPUT_FOLDER,fname)
+    with open(path,"w",encoding="utf-8") as f:
+        json.dump(fragments,f,ensure_ascii=False,indent=2)
+    print(f"[green]Saved {len(fragments)} fragments -> {path}[/green]")
+
+# ---------------- Main ----------------
+def main():
+    print("[cyan]Enter configs (one per line). Finish with Ctrl+D/Ctrl+Z.[/cyan]")
+    lines=[]
+    while True:
+        try: ln=input()
+        except EOFError: break
+        if ln.strip(): lines.append(ln.strip())
+    if not lines: print("[red]No configs entered.[/red]"); return
+
+    # dedupe
+    seen=set(); unique=[]
+    for l in lines:
+        if l not in seen: unique.append(l); seen.add(l)
+    lines=unique
+
+    # ping
+    print("[cyan]Probing hosts...[/cyan]")
+    records=[]
+    with Progress(SpinnerColumn(), "[progress.description]{task.description}", BarColumn(), TimeRemainingColumn()) as progress:
+        task=progress.add_task("Measuring...", total=len(lines))
+        with ThreadPoolExecutor(max_workers=min(MAX_THREADS,len(lines))) as ex:
+            future_map={}
+            for cfg in lines:
+                host=extract_host(cfg) or ""
+                future=ex.submit(measure_latency, host)
+                future_map[future]=(cfg, host)
+            for fut in as_completed(future_map):
+                cfg, host=future_map[fut]
+                latency=None
+                try: latency=fut.result()
+                except: latency=None
+                parsed=parse_link(cfg)
+                parsed["latency"]=latency
+                parsed["protocol"]=parsed.get("protocol") or extract_protocol(cfg)
+                parsed["raw"]=cfg
+                records.append(parsed)
+                progress.update(task, advance=1)
+
+    display_ping_table(records)
+
+    while True:
+        print("\nFilter options:\n 1) Keep excellent/good\n 2) Keep up to warn (recommended)\n 3) Keep all except no_reply\n 4) Keep all")
+        choice=input("Choose filter (1-4, default 2): ").strip() or "2"
+        if choice=="1": allowed={"excellent","good"}
+        elif choice=="2": allowed={"excellent","good","warn"}
+        elif choice=="3": allowed={"excellent","good","warn","bad"}
+        else: allowed={"excellent","good","warn","bad","no_reply"}
+
+        selected=[r for r in records if classify_latency_val(r.get("latency")) in allowed]
+        print(f"[cyan]Selected {len(selected)} configs.[/cyan]")
+        fragments=[]
+        for r in selected:
+            frag=build_fragment(r)
+            frag.setdefault("meta",{}); frag["meta"]["ping_ms"]=r.get("latency"); frag["meta"]["ping_level"]=classify_latency_val(r.get("latency"))
+            fragments.append(frag)
+        if fragments: save_fragments(fragments)
+        else: print("[yellow]No fragments for this filter.[/yellow]")
+        again=input("Choose another filter? (y/N): ").strip().lower()
+        if again!="y": break
+    print("[green]Done.[/green]")
+
+if __name__=="__main__":
+    main()
+
+
+
+

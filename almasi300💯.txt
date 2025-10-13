@@ -1,0 +1,729 @@
+import os
+import re
+import json
+import base64
+import subprocess
+import random
+import time
+from urllib.parse import parse_qs, unquote, quote
+from typing import Optional, Dict, Any, List, Tuple
+
+# rich used for colored output if available
+try:
+    from rich import print
+    from rich.prompt import Prompt
+    from rich.table import Table
+except Exception:
+    def print(*a, **k):
+        __builtins__["print"](*a, **k)
+    class Prompt:
+        @staticmethod
+        def ask(prompt, default=None, choices=None):
+            v = input(f"{prompt} " )
+            return v if v else (default or "")
+    class Table:
+        def __init__(self, title=None): self.rows=[]
+        def add_column(self, *a, **k): pass
+        def add_row(self,*a): self.rows.append(a)
+        def __str__(self):
+            return "\n".join(["\t".join(map(str,r)) for r in self.rows])
+        def __repr__(self): return self.__str__()
+
+# ثابت مسیر خروجی
+SAVE_DIR = "/storage/emulated/0/Download/almasi98"
+os.makedirs(SAVE_DIR, exist_ok=True)
+
+# پینگ3 اگر نصب باشد برای نمونه‌گیری مکمل
+try:
+    from ping3 import ping as ping3_ping
+except Exception:
+    ping3_ping = None
+
+# -------------------- helpers --------------------
+def extract_host(config):
+    match = re.search(r"@([^:/?#]+)", config)
+    return match.group(1) if match else None
+
+def ping_host(host):
+    try:
+        output = subprocess.check_output(
+            ["ping", "-c", "3", "-W", "1", host],
+            stderr=subprocess.DEVNULL
+        ).decode()
+        match = re.search(r"rtt min/avg/max/mdev = [\d.]+/([\d.]+)", output)
+        return float(match.group(1)) if match else None
+    except Exception:
+        return None
+
+def classify_ping(ping):
+    if ping is None:
+        return "bad", "[bold red][BAD][/bold red]"
+    elif ping < 150:
+        return "good", "[bold green][GOOD][/bold green]"
+    elif ping < 300:
+        return "warn", "[bold yellow][WARN][/bold yellow]"
+    else:
+        return "bad", "[bold red][BAD][/bold red]"
+
+def fetch_sub_link(url):
+    try:
+        r = requests.get(url, timeout=15)
+        r.raise_for_status()
+        content = r.text
+        content = ''.join([c for c in content if ord(c) < 128])
+        return content
+    except Exception as e:
+        print(f"[red]❌ Failed to fetch: {url}\nError: {e}[/red]")
+        return None
+
+def parse_configs(raw_data):
+    lines = raw_data.splitlines()
+    return [line.strip() for line in lines if line.strip()]
+
+def categorize_configs(configs):
+    vless, trojan, ss, others = [], [], [], []
+    for cfg in configs:
+        lower = cfg.lower()
+        if "vless://" in lower:
+            vless.append(cfg)
+        elif "trojan://" in lower:
+            trojan.append(cfg)
+        elif "ss://" in lower:
+            ss.append(cfg)
+        else:
+            others.append(cfg)
+    return vless, trojan, ss, others
+
+def save_to_file(filename, data):
+    with open(filename, "w", encoding="utf-8") as f:
+        for d in data:
+            f.write(d + "\n")
+    print(f"[green]✅ Saved file: {os.path.abspath(filename)}[/green]")
+
+def save_json(filename, data):
+    with open(filename, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    print(f"[green]✅ Saved JSON: {os.path.abspath(filename)}[/green]")
+
+# ---------- Parsing functions (robust) ----------
+def parse_vless(link: str) -> Optional[Dict[str,Any]]:
+    try:
+        main = link.split("://",1)[1]
+        remark = ""
+        if "#" in main:
+            main, remark = main.split("#",1)
+            remark = unquote(remark)
+        params = {}
+        if "?" in main:
+            before_q, q = main.split("?",1)
+            params = {k:v[0] for k,v in parse_qs(q).items()}
+        else:
+            before_q = main
+        user = ""
+        hostport = before_q
+        if "@" in before_q:
+            user, hostport = before_q.split("@",1)
+        host = hostport
+        port = 443
+        if ":" in hostport:
+            h,p = hostport.split(":",1)
+            host = h
+            if p.isdigit():
+                port = int(p)
+            else:
+                # try to extract digits prefix
+                m = re.match(r"(\d+)", p)
+                if m:
+                    port = int(m.group(1))
+        return {"protocol":"vless","raw":link,"address":host,"port":int(port),"user":user,"params":params,"remark":remark or link}
+    except Exception:
+        return None
+
+def parse_trojan(link: str) -> Optional[Dict[str,Any]]:
+    try:
+        main = link.split("://",1)[1]
+        remark = ""
+        if "#" in main:
+            main, remark = main.split("#",1)
+            remark = unquote(remark)
+        params = {}
+        if "?" in main:
+            before_q,q = main.split("?",1)
+            params = {k:v[0] for k,v in parse_qs(q).items()}
+        else:
+            before_q = main
+        passwd = ""
+        hostport = before_q
+        if "@" in before_q:
+            passwd, hostport = before_q.split("@",1)
+        host = hostport
+        port = 443
+        if ":" in hostport:
+            h,p = hostport.split(":",1)
+            host = h
+            if p.isdigit():
+                port = int(p)
+            else:
+                m = re.match(r"(\d+)", p)
+                if m:
+                    port = int(m.group(1))
+        return {"protocol":"trojan","raw":link,"address":host,"port":int(port),"user":passwd,"params":params,"remark":remark or link}
+    except Exception:
+        return None
+
+def parse_ss(link: str) -> Optional[Dict[str,Any]]:
+    try:
+        main = link.split("://",1)[1]
+        remark = ""
+        if "#" in main:
+            main, remark = main.split("#",1)
+            remark = unquote(remark)
+        # direct method:pass@host:port
+        if "@" in main and ":" in main.split("@",1)[1]:
+            method_pass, hostport = main.split("@",1)
+            if ":" in method_pass:
+                method, password = method_pass.split(":",1)
+            else:
+                method, password = method_pass, ""
+            address, port = (hostport.split(":",1)+["443"])[:2]
+            port = int(port) if str(port).isdigit() else 443
+            return {"protocol":"ss","raw":link,"address":address,"port":port,"user":password,"method":method,"params":{},"remark":remark or link}
+        # base64 encoded form (ss://base64)
+        decoded = safe_b64_decode_try(main)
+        if decoded and "@" in decoded:
+            method_pass, hostport = decoded.split("@",1)
+            if ":" in method_pass:
+                method,password = method_pass.split(":",1)
+            else:
+                method,password = method_pass,""
+            address, port = (hostport.split(":",1)+["443"])[:2]
+            port = int(port) if str(port).isdigit() else 443
+            return {"protocol":"ss","raw":link,"address":address,"port":port,"user":password,"method":method,"params":{},"remark":remark or link}
+    except Exception:
+        return None
+    return None
+
+def parse_vmess(link: str) -> Optional[Dict[str,Any]]:
+    try:
+        main = link.split("://",1)[1]
+        remark = ""
+        if "#" in main:
+            main, remark = main.split("#",1)
+            remark = unquote(remark)
+        decoded = safe_b64_decode_try(main)
+        if not decoded:
+            return None
+        # vmess json encoded
+        try:
+            js = json.loads(decoded)
+            address = js.get("add") or js.get("address") or ""
+            port = int(js.get("port") or 443)
+            user = js.get("id","")
+            network = js.get("net","tcp")
+            params = {"network":network}
+            return {"protocol":"vmess","raw":link,"address":address,"port":port,"user":user,"params":params,"remark":remark or link}
+        except Exception:
+            # alternate: address:port:uuid:net ...
+            parts = decoded.split(":")
+            if len(parts) >= 3:
+                address = parts[0]
+                port = int(parts[1]) if parts[1].isdigit() else 443
+                user = parts[2]
+                net = parts[3] if len(parts) > 3 else "tcp"
+                return {"protocol":"vmess","raw":link,"address":address,"port":port,"user":user,"params":{"network":net},"remark":remark or link}
+    except Exception:
+        return None
+    return None
+
+def parse_config(conf: str) -> Optional[Dict[str,Any]]:
+    conf = conf.strip()
+    if conf.startswith("vless://"):
+        return parse_vless(conf)
+    if conf.startswith("trojan://"):
+        return parse_trojan(conf)
+    if conf.startswith("ss://"):
+        return parse_ss(conf)
+    if conf.startswith("vmess://"):
+        return parse_vmess(conf)
+    # unsupported
+    return None
+
+# ---------- Ping functions ----------
+def ping_subprocess(host: str, count: int = 3) -> Optional[float]:
+    if not host:
+        return None
+    try:
+        out = subprocess.check_output(["ping", "-c", str(count), "-W", "1", host], stderr=subprocess.DEVNULL).decode(errors="ignore")
+        m = re.search(r"rtt min/avg/max/(?:mdev|stddev) = [\d.]+/([\d.]+)", out)
+        if not m:
+            m = re.search(r"min/avg/max/(?:mdev|stddev) = [\d.]+/([\d.]+)", out)
+        if m:
+            return float(m.group(1))
+    except Exception:
+        return None
+    return None
+
+def ping_ping3(host: str, count: int = 3) -> Optional[float]:
+    if ping3_ping is None:
+        return None
+    results = []
+    for _ in range(count):
+        try:
+            r = ping3_ping(host, timeout=1, unit="ms")
+            if r is not None:
+                results.append(r)
+        except Exception:
+            continue
+    if results:
+        return sum(results)/len(results)
+    return None
+
+def probe_host(host: str) -> Tuple[Optional[float], Optional[float], str]:
+    """
+    Returns (sub_ms, ping3_ms, final_status)
+    final_status in {'good','warn','bad'}
+    """
+    sub = ping_subprocess(host, count=2)
+    ping3m = ping_ping3(host, count=3) if ping3_ping else None
+    # decide final (if either good -> good)
+    ms_candidate = None
+    if sub is not None and ping3m is not None:
+        ms_candidate = min(sub, ping3m)
+    else:
+        ms_candidate = sub if sub is not None else ping3m
+    if ms_candidate is None:
+        status = "bad"
+    elif ms_candidate < 150:
+        status = "good"
+    elif ms_candidate < 300:
+        status = "warn"
+    else:
+        status = "bad"
+    return sub, ping3m, status
+
+# ---------- Fragment builders ----------
+def fragment_v1(parsed: Dict[str,Any], ping_info: Tuple[Optional[float],Optional[float],str]=None) -> Optional[Dict[str,Any]]:
+    """
+    Simple & stable fragment builder.
+    remark preserved exactly as parsed['remark'] (no addition).
+    Adds meta.ping info separately.
+    """
+    if not parsed:
+        return None
+    proto = parsed.get("protocol")
+    address = parsed.get("address")
+    port = parsed.get("port") or 443
+    remark = parsed.get("remark") or parsed.get("raw") or f"{proto}_{address}"
+    params = parsed.get("params",{}) or {}
+    user = parsed.get("user","") or parsed.get("id","")
+    # ping meta
+    sub_ms, ping3_ms, status = (None, None, None)
+    if ping_info:
+        sub_ms, ping3_ms, status = ping_info
+    ping_ms = None
+    if sub_ms is not None and ping3_ms is not None:
+        ping_ms = min(sub_ms, ping3_ms)
+    else:
+        ping_ms = sub_ms if sub_ms is not None else ping3_ms
+
+    # default network/security
+    network = params.get("type") or params.get("network") or ("ws" if proto in ("vless","vmess","trojan") else "tcp")
+    security = params.get("security") or ("tls" if params.get("tls") in ("tls","true","1") or network in ("ws","grpc") else "none")
+
+    # outbound base
+    if proto == "vless":
+        outbound = {
+            "tag":"proxy",
+            "protocol":"vless",
+            "settings":{"vnext":[{"address":address,"port":int(port),"users":[{"id":user,"encryption":params.get("encryption","none"),"flow":params.get("flow","")}]}]},
+            "streamSettings": {"network":network,"security":security,"sockopt":{"dialerProxy":"fragment"}}
+        }
+        if network == "ws":
+            outbound["streamSettings"]["wsSettings"] = {"path": params.get("path","/"), "headers":{"Host": params.get("host", address)}}
+        if network == "grpc":
+            svc = params.get("serviceName") or params.get("service","")
+            outbound["streamSettings"]["grpcSettings"] = {"serviceName": svc, "multiMode": False} if svc else {"multiMode": False}
+        if security in ("tls","xtls"):
+            outbound["streamSettings"]["tlsSettings"] = {"serverName": params.get("sni", params.get("host", address)), "fingerprint": params.get("fp","chrome"), "alpn": (params.get("alpn") or "http/1.1").split(",")}
+    elif proto == "trojan":
+        outbound = {
+            "tag":"proxy",
+            "protocol":"trojan",
+            "settings":{"servers":[{"address":address,"port":int(port),"password":user}]},
+            "streamSettings":{"network":network,"security":security,"sockopt":{"dialerProxy":"fragment"}}
+        }
+        if network == "ws":
+            outbound["streamSettings"]["wsSettings"] = {"path": params.get("path","/"), "headers":{"Host": params.get("host", address)}}
+        if security in ("tls","xtls"):
+            outbound["streamSettings"]["tlsSettings"] = {"serverName": params.get("sni", params.get("host", address)), "fingerprint": params.get("fp","chrome"), "alpn": (params.get("alpn") or "http/1.1").split(",")}
+    elif proto == "ss":
+        method = parsed.get("method") or params.get("method","aes-128-gcm")
+        passwd = parsed.get("user","")
+        outbound = {
+            "tag":"proxy",
+            "protocol":"shadowsocks",
+            "settings":{"servers":[{"address":address,"port":int(port),"method":method,"password":passwd}]},
+            "streamSettings":{"network":"tcp","security":"none","sockopt":{"dialerProxy":"fragment"}}
+        }
+    elif proto == "vmess":
+        user_id = parsed.get("user","")
+        network_vm = parsed.get("params",{}).get("network","tcp")
+        outbound = {
+            "tag":"proxy",
+            "protocol":"vmess",
+            "settings":{"vnext":[{"address":address,"port":int(port),"users":[{"id":user_id,"security":"auto"}]}]},
+            "streamSettings":{"network":network_vm,"security":"tls","sockopt":{"dialerProxy":"fragment"}}
+        }
+    else:
+        return None
+
+    fragment = {
+        "remarks": remark,   # preserve exactly
+        "log": {"loglevel":"warning"},
+        "inbounds": [
+            {"port":10808,"protocol":"socks","settings":{"auth":"noauth","udp":True,"userLevel":8},"tag":"socks-in","sniffing":{"destOverride":["http","tls"],"enabled":True,"routeOnly":True}},
+            {"port":10853,"protocol":"dokodemo-door","settings":{"address":"1.1.1.1","network":"tcp,udp","port":53},"tag":"dns-in"}
+        ],
+        "outbounds": [
+            outbound,
+            {"tag":"fragment","protocol":"freedom","settings":{"fragment":{"packets":params.get("fragment_packets","tlshello"),"length":params.get("fragment_length","100-200"),"interval":params.get("fragment_interval","1-1")},"domainStrategy":"UseIPv4v6"}}
+        ],
+        "routing": {"domainStrategy":"IPIfNonMatch","rules":[{"inboundTag":["dns-in"],"outboundTag":"dns-out","type":"field"},{"network":"tcp","outboundTag":"proxy","type":"field"}]},
+        "meta": {"builder":"v1", "ping_status": status, "ping_ms": (round(ping_ms,2) if isinstance(ping_ms,(int,float)) else None)}
+    }
+    return fragment
+#----------------fragment_v2--------------------
+def fragment_v2(parsed: Dict[str,Any], ping_info: Tuple[Optional[float],Optional[float],str]=None) -> Optional[Dict[str,Any]]:
+    """
+    Enhanced fragment: adds dns block, sockopt tweaks, alpn/h2/http/xtls support.
+    remark preserved exactly.
+    """
+    if not parsed:
+        return None
+    base_frag = fragment_v1(parsed, ping_info)
+    if not base_frag:
+        return None
+    # extend DNS and meta info for v2
+    address = parsed.get("address")
+    # add dns section if not present
+    dns_block = {
+        "servers": [
+            {"address":"https://1.1.1.1/dns-query","tag":"remote-dns"},
+            "1.1.1.1",
+            "8.8.8.8"
+        ],
+        "queryStrategy":"UseIP"
+    }
+    base_frag["dns"] = dns_block
+    base_frag["meta"]["builder"] = "v2"
+    # improve sockopt for proxy outbound
+    try:
+        ob = base_frag["outbounds"][0]
+        ob.setdefault("streamSettings", {})
+        ss = ob["streamSettings"]
+        ss.setdefault("sockopt", {})
+        ss["sockopt"].update({"tcpNoDelay": True, "tcpKeepAliveIdle": 120})
+        # if tlsSettings present, ensure alpn list
+        if "tlsSettings" in ss:
+            tls = ss["tlsSettings"]
+            tls.setdefault("alpn", ["http/1.1"])
+        # ensure wsSettings headers exist
+        if ss.get("network") == "ws":
+            ss.setdefault("wsSettings", {"path":"/","headers":{"Host": address}})
+    except Exception:
+        pass
+    return base_frag
+#--------------fragment_xtls---------------------
+
+def fragment_xtls(parsed: Dict[str,Any], ping_info: Tuple[Optional[float],Optional[float],str]=None) -> Optional[Dict[str,Any]]:
+    """
+    XTLS-specialized fragment (vless + xtls). remark preserved.
+    """
+    if not parsed:
+        return None
+    proto = parsed.get("protocol")
+    if proto not in ("vless","vmess"):
+        return fragment_v2(parsed, ping_info)
+    address = parsed.get("address")
+    port = parsed.get("port") or 443
+    user = parsed.get("user","")
+    params = parsed.get("params",{}) or {}
+    remark = parsed.get("remark") or parsed.get("raw") or f"{proto}_{address}"
+    # ping meta
+    sub_ms, ping3_ms, status = (None,None,None)
+    if ping_info:
+        sub_ms, ping3_ms, status = ping_info
+    ping_ms = None
+    if sub_ms is not None and ping3_ms is not None:
+        ping_ms = min(sub_ms,ping3_ms)
+    else:
+        ping_ms = sub_ms if sub_ms is not None else ping3_ms
+
+    stream = {"network": params.get("type","ws"), "security": "xtls", "sockopt": {"dialerProxy":"fragment", "tcpNoDelay": True, "tcpKeepAliveIdle": 120}}
+    stream["tlsSettings"] = {"serverName": params.get("sni", params.get("host", address))}
+    if stream["network"] == "ws":
+        stream["wsSettings"] = {"path": params.get("path","/"), "headers": {"Host": params.get("host", address)}}
+    outbound = {"tag":"proxy","protocol":"vless","settings":{"vnext":[{"address":address,"port":int(port),"users":[{"id":user,"encryption":"none","flow":params.get("flow","")}] }]},"streamSettings":stream}
+    fragment = {
+        "remarks": remark,
+        "log":{"loglevel":"warning"},
+        "inbounds":[{"port":10812,"protocol":"socks","settings":{"auth":"noauth","udp":True,"userLevel":8},"tag":"socks-in"}],
+        "outbounds":[outbound, {"tag":"fragment","protocol":"freedom","settings":{"fragment":{"packets":"tlshello","length":"100-200","interval":"1-1"},"domainStrategy":"UseIPv4v6"}}],
+        "routing":{"domainStrategy":"IPIfNonMatch","rules":[{"inboundTag":["socks-in"],"outboundTag":"proxy","type":"field"}]},
+        "meta": {"builder":"xtls","ping_status": status, "ping_ms": (round(ping_ms,2) if isinstance(ping_ms,(int,float)) else None)}
+    }
+    return fragment
+
+# ---------- Combo generators ----------
+def generate_combo2(configs: List[str], cap: int = 200) -> List[str]:
+    n = len(configs)
+    if n < 2: return []
+    indices = [(i,j) for i in range(n) for j in range(i+1,n)]
+    random.shuffle(indices)
+    combos=[]
+    seen=set()
+    for i,j in indices:
+        combo=f"{configs[i]}+{configs[j]}"
+        if combo not in seen:
+            combos.append(combo)
+            seen.add(combo)
+        if len(combos)>=cap:
+            break
+    return combos
+
+def generate_combo3(configs: List[str], cap: int = 200) -> List[str]:
+    n = len(configs)
+    if n < 3: return []
+    cands=[]
+    for a in range(n):
+        for b in range(a+1,n):
+            for c in range(b+1,n):
+                cands.append((a,b,c))
+                if len(cands) >= cap * 8:
+                    break
+            if len(cands) >= cap * 8:
+                break
+        if len(cands) >= cap * 8:
+            break
+    random.shuffle(cands)
+    combos=[]
+    seen=set()
+    for i,j,k in cands:
+        A=configs[i];B=configs[j];C=configs[k]
+        tail = strip_proto(C)
+        combo = f"{A}+{B}+ss://{tail}"
+        if combo in seen: continue
+        seen.add(combo)
+        combos.append(combo)
+        if len(combos)>=cap:
+            break
+    return combos
+
+# ---------- Main integration (menu kept similar to your original) ----------
+def main():
+    print("[bold cyan]Choose input mode:[/bold cyan]")
+    print("1) Paste configs manually")
+    print("2) Fetch from subscription URL(s) (base64 or plain list)")
+    mode = input("Enter choice (1 or 2): ").strip()
+    lines = []
+    if mode == "2":
+        import requests
+        while True:
+            url = input("Enter subscription URL (empty to stop): ").strip()
+            if not url:
+                break
+            try:
+                r = requests.get(url, timeout=15)
+                txt = r.text.strip()
+                # try base64 decode full body
+                dec = None
+                try:
+                    dec = base64.b64decode(txt + '=' * (-len(txt)%4)).decode(errors="ignore")
+                except Exception:
+                    dec = None
+                if dec and any(p in dec for p in ("vless://","vmess://","trojan://","ss://")):
+                    txt = dec
+                for line in txt.splitlines():
+                    ln = line.strip()
+                    if ln and any(ln.startswith(p) for p in ("vless://","vmess://","trojan://","ss://")):
+                        lines.append(ln)
+                print(f"[green]Fetched lines so far: {len(lines)}[/green]")
+            except Exception as e:
+                print(f"[red]Fetch error: {e}[/red]")
+            more = input("Add another? (y/N): ").strip().lower()
+            if more != "y":
+                break
+    else:
+        print("[cyan]Paste your configs line by line. Press Ctrl+D (or empty line then Ctrl+D) to finish:[/cyan]")
+        try:
+            while True:
+                l = input()
+                if l and l.strip():
+                    lines.append(l.strip())
+                else:
+                    # skip empty
+                    continue
+        except EOFError:
+            pass
+
+    # dedupe and keep only supported
+    lines = list(dict.fromkeys([ln for ln in lines if ln and any(ln.startswith(p) for p in ("vless://","vmess://","trojan://","ss://"))]))
+
+    if not lines:
+        print("[bold red]No configs provided. Exiting.[/bold red]")
+        return
+
+    # parse + probe
+    parsed_map = {}
+    valid_configs = []
+    ping_results = {}  # raw -> (sub_ms,ping3_ms,status_final)
+    print("\n[bold cyan]Probing hosts (fast) ...[/bold cyan]")
+    for cfg in lines:
+        parsed = parse_config(cfg)
+        if not parsed:
+            print(f"[bold yellow]Ignored (could not parse):[/bold yellow] {cfg}")
+            continue
+        host = parsed.get("address")
+        # if host missing, try to extract via regex fallback
+        if not host:
+            m = re.search(r"@([^:/?#\s]+)", cfg)
+            host = m.group(1) if m else None
+        if not host:
+            print(f"[bold yellow]Ignored (no host found):[/bold yellow] {cfg}")
+            continue
+        sub_ms, ping3_ms, status = probe_host(host)
+        ping_results[cfg] = (sub_ms, ping3_ms, status)
+        parsed["raw"] = cfg
+        parsed_map[cfg] = parsed
+        valid_configs.append(cfg)
+        lbl = "[bold red][BAD][/bold red]"
+        if status == "good": lbl = "[bold green][GOOD][/bold green]"
+        elif status == "warn": lbl = "[bold yellow][WARN][/bold yellow]"
+        display_ms = None
+        if sub_ms is not None and ping3_ms is not None:
+            display_ms = min(sub_ms,ping3_ms)
+        else:
+            display_ms = sub_ms if sub_ms is not None else ping3_ms
+        print(f"{lbl} {host} -> {display_ms if display_ms is not None else 'NO REPLY'} ms   ({parsed.get('remark')})")
+
+    # categorize lists for menu options
+    vless_list = [c for c in valid_configs if c.startswith("vless://")]
+    vmess_list = [c for c in valid_configs if c.startswith("vmess://")]
+    trojan_list = [c for c in valid_configs if c.startswith("trojan://")]
+    ss_list = [c for c in valid_configs if c.startswith("ss://")]
+    green_list = [c for c,(s1,s2,status) in ping_results.items() if status=="good"]
+    green_yellow_list = [c for c,(s1,s2,status) in ping_results.items() if status in ("good","warn")]
+
+    # interactive menu (preserve options you wanted)
+    while True:
+        print("\n[bold cyan]Select output option:[/bold cyan]")
+        print("1) VLESS only")
+        print("2) VMess only")
+        print("3) Trojan only")
+        print("4) Shadowsocks only")
+        print("5) All configs (TXT)")
+        print("6) Combo-2")
+        print("7) Combo-3")
+        print("8) Green only (GOOD)")
+        print("9) Green + Yellow (GOOD + WARN)")
+        print("10) Save all (custom filename)")
+        print("11) Save parsed JSON (with ping)")
+        print("12) Fragment V1 (one fragment per parsed item)")
+        print("13) Fragment V2 (enhanced)")
+        print("14) Fragment XTLS")
+        print("0) Exit")
+        choice = input("Enter choice number: ").strip()
+        if choice == "0":
+            print("[bold green]Exiting...[/bold green]")
+            break
+
+        def save_txt(list_items: List[str], default_name: str):
+            if not list_items:
+                print("[bold red]No items to save for this selection.[/bold red]")
+                return
+            fname = input(f"Enter filename (without extension) [{default_name}]: ").strip() or default_name
+            path = os.path.join(SAVE_DIR, fname + ".txt")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("\n".join(list_items))
+            print(f"[bold green]Saved -> {path}[/bold green]")
+
+        if choice == "1":
+            save_txt(vless_list, "vless")
+            continue
+        if choice == "2":
+            save_txt(vmess_list, "vmess")
+            continue
+        if choice == "3":
+            save_txt(trojan_list, "trojan")
+            continue
+        if choice == "4":
+            save_txt(ss_list, "shadowsocks")
+            continue
+        if choice == "5":
+            save_txt(valid_configs, "all_configs")
+            continue
+        if choice == "6":
+            combos = generate_combo2(valid_configs, cap=200)
+            save_txt(combos, "combo2")
+            continue
+        if choice == "7":
+            combos = generate_combo3(valid_configs, cap=200)
+            save_txt(combos, "combo3")
+            continue
+        if choice == "8":
+            save_txt(green_list, "green")
+            continue
+        if choice == "9":
+            save_txt(green_yellow_list, "green_yellow")
+            continue
+        if choice == "10":
+            save_txt(valid_configs, "output_all")
+            continue
+        if choice == "11":
+            # parsed JSON with ping info
+            parsed_list = []
+            for cfg in valid_configs:
+                p = parsed_map.get(cfg)
+                if not p: continue
+                sub_ms, ping3_ms, status = ping_results.get(cfg,(None,None,"bad"))
+                pcopy = dict(p)
+                pcopy["ping_sub_ms"] = sub_ms
+                pcopy["ping_ping3_ms"] = ping3_ms
+                pcopy["ping_status"] = status
+                parsed_list.append(pcopy)
+            fname = input("Enter filename for parsed JSON (without extension) [parsed_configs]: ").strip() or "parsed_configs"
+            path = os.path.join(SAVE_DIR, fname + ".json")
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(parsed_list, f, ensure_ascii=False, indent=2)
+            print(f"[bold green]Saved parsed JSON -> {path}[/bold green]")
+            continue
+
+        if choice in ("12","13","14"):
+            fragments = []
+            for cfg in valid_configs:
+                parsed = parsed_map.get(cfg)
+                ping_info = ping_results.get(cfg)
+                if choice == "12":
+                    frag = fragment_v1(parsed, ping_info)
+                elif choice == "13":
+                    frag = fragment_v2(parsed, ping_info)
+                else:
+                    frag = fragment_xtls(parsed, ping_info)
+                if frag:
+                    fragments.append(frag)
+            fname = input("Enter filename for Fragment JSON (without extension) [fragments]: ").strip() or "fragments"
+            path = os.path.join(SAVE_DIR, fname + ".json")
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(fragments, f, ensure_ascii=False, indent=2)
+            print(f"[bold green]Saved fragments -> {path}[/bold green]")
+            continue
+
+        print("[bold red]Invalid choice[/bold red]")
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+

@@ -1,0 +1,532 @@
+import os
+import re
+import subprocess
+import requests
+import json
+import base64
+import urllib.parse
+from urllib.parse import quote, unquote, parse_qs
+from typing import Optional, Dict, Any, Tuple
+from rich import print, box
+from rich.table import Table
+from rich.prompt import Prompt
+import random  # اضافه شده برای combo
+
+protocols = ["vmess://", "vless://", "trojan://", "ss://"]
+
+# -------------------- helpers --------------------
+def extract_host(config):
+    match = re.search(r"@([^:/?#]+)", config)
+    return match.group(1) if match else None
+
+def ping_host(host):
+    try:
+        output = subprocess.check_output(
+            ["ping", "-c", "3", "-W", "1", host],
+            stderr=subprocess.DEVNULL
+        ).decode()
+        match = re.search(r"rtt min/avg/max/mdev = [\d.]+/([\d.]+)", output)
+        return float(match.group(1)) if match else None
+    except Exception:
+        return None
+
+def classify_ping(ping):
+    if ping is None:
+        return "bad", "[bold red][BAD][/bold red]"
+    elif ping < 150:
+        return "good", "[bold green][GOOD][/bold green]"
+    elif ping < 300:
+        return "warn", "[bold yellow][WARN][/bold yellow]"
+    else:
+        return "bad", "[bold red][BAD][/bold red]"
+
+def fetch_sub_link(url):
+    try:
+        r = requests.get(url, timeout=15)
+        r.raise_for_status()
+        content = r.text
+        content = ''.join([c for c in content if ord(c) < 128])
+        return content
+    except Exception as e:
+        print(f"[red]❌ Failed to fetch: {url}\nError: {e}[/red]")
+        return None
+
+def parse_configs(raw_data):
+    lines = raw_data.splitlines()
+    configs = [line.strip() for line in lines if line.strip()]
+    return configs
+
+def categorize_configs(configs):
+    vless, trojan, ss, others = [], [], [], []
+    for cfg in configs:
+        lower = cfg.lower()
+        if "vless://" in lower:
+            vless.append(cfg)
+        elif "trojan://" in lower:
+            trojan.append(cfg)
+        elif "ss://" in lower:
+            ss.append(cfg)
+        else:
+            others.append(cfg)
+    return vless, trojan, ss, others
+
+def save_to_file(filename, data):
+    with open(filename, "w", encoding="utf-8") as f:
+        for d in data:
+            f.write(d + "\n")
+    print(f"[green]✅ Saved file: {os.path.abspath(filename)}[/green]")
+
+def save_json(filename, data):
+    with open(filename, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    print(f"[green]✅ Saved JSON: {os.path.abspath(filename)}[/green]")
+
+# -------------------- parsers -------------------
+def safe_b64_decode_try(data: str) -> Optional[str]:
+    try:
+        data += "=" * ((4 - len(data) % 4) % 4)
+        return base64.urlsafe_b64decode(data.encode()).decode()
+    except Exception:
+        return None
+
+def parse_vless(link: str) -> Optional[Dict[str, Any]]:
+    try:
+        main = link.split("://",1)[1]
+        remark = ""
+        if "#" in main:
+            main, remark = main.split("#",1)
+            remark = unquote(remark)
+        params = {}
+        if "?" in main:
+            before_q, q = main.split("?",1)
+            params = {k:v[0] for k,v in parse_qs(q).items()}
+        else:
+            before_q = main
+        user, hostport = ("", before_q)
+        if "@" in before_q:
+            user, hostport = before_q.split("@",1)
+        host, port = hostport, 443
+        if ":" in hostport:
+            h, p = hostport.split(":",1)
+            host = h
+            if p.isdigit():
+                port = int(p)
+        return {"protocol":"vless","raw":link,"address":host,"port":int(port),"user":user,"params":params,"remark":remark or link}
+    except Exception:
+        return None
+
+def parse_trojan(link: str) -> Optional[Dict[str, Any]]:
+    try:
+        main = link.split("://",1)[1]
+        remark = ""
+        if "#" in main:
+            main, remark = main.split("#",1)
+            remark = unquote(remark)
+        params = {}
+        if "?" in main:
+            before_q,q = main.split("?",1)
+            params = {k:v[0] for k,v in parse_qs(q).items()}
+        else:
+            before_q = main
+        passwd, hostport = ("", before_q)
+        if "@" in before_q:
+            passwd, hostport = before_q.split("@",1)
+        host, port = hostport, 443
+        if ":" in hostport:
+            h, p = hostport.split(":",1)
+            host = h
+            if p.isdigit():
+                port = int(p)
+        return {"protocol":"trojan","raw":link,"address":host,"port":int(port),"user":passwd,"params":params,"remark":remark or link}
+    except Exception:
+        return None
+
+def parse_ss(link: str) -> Optional[Dict[str, Any]]:
+    try:
+        main = link.split("://",1)[1]
+        remark = ""
+        if "#" in main:
+            main, remark = main.split("#",1)
+            remark = unquote(remark)
+        if "@" in main and ":" in main.split("@",1)[1]:
+            method_pass, hostport = main.split("@",1)
+            if ":" in method_pass:
+                method, password = method_pass.split(":",1)
+            else:
+                method, password = method_pass, ""
+            address, port = (hostport.split(":",1)+["443"])[:2]
+            port = int(port) if port.isdigit() else 443
+            return {"protocol":"ss","raw":link,"address":address,"port":port,"user":password,"method":method,"params":{},"remark":remark or link}
+        decoded = safe_b64_decode_try(main)
+        if decoded and "@" in decoded:
+            method_pass, hostport = decoded.split("@",1)
+            if ":" in method_pass:
+                method,password = method_pass.split(":",1)
+            else:
+                method,password = method_pass,""
+            address, port = (hostport.split(":",1)+["443"])[:2]
+            port = int(port) if port.isdigit() else 443
+            return {"protocol":"ss","raw":link,"address":address,"port":port,"user":password,"method":method,"params":{},"remark":remark or link}
+    except Exception:
+        return None
+    return None
+
+def parse_vmess(link: str) -> Optional[Dict[str, Any]]:
+    try:
+        main = link.split("://",1)[1]
+        remark = ""
+        if "#" in main:
+            main, remark = main.split("#",1)
+            remark = unquote(remark)
+        decoded = safe_b64_decode_try(main)
+        if not decoded:
+            return None
+        js = json.loads(decoded)
+        address = js.get("add","")
+        port = int(js.get("port",443))
+        user = js.get("id","")
+        network = js.get("net","tcp")
+        return {"protocol":"vmess","raw":link,"address":address,"port":port,"user":user,"params":{"network":network},"remark":remark or link}
+    except Exception:
+        return None
+
+def parse_config(conf: str) -> Optional[Dict[str,Any]]:
+    conf = conf.strip()
+    if conf.startswith("vless://"):
+        return parse_vless(conf)
+    if conf.startswith("trojan://"):
+        return parse_trojan(conf)
+    if conf.startswith("ss://"):
+        return parse_ss(conf)
+    if conf.startswith("vmess://"):
+        return parse_vmess(conf)
+    return None
+
+def parse_link_general(link: str):
+    parsed = parse_config(link)
+    if parsed:
+        return parsed.get("protocol"), parsed
+    return None, None
+
+# ---------- Ping functions ----------
+def ping_subprocess(host: str, count: int = 3) -> Optional[float]:
+    if not host:
+        return None
+    try:
+        out = subprocess.check_output(
+            ["ping", "-c", str(count), "-W", "1", host],
+            stderr=subprocess.DEVNULL
+        ).decode(errors="ignore")
+        m = re.search(r"rtt min/avg/max/(?:mdev|stddev) = [\d.]+/([\d.]+)", out)
+        if not m:
+            m = re.search(r"min/avg/max/(?:mdev|stddev) = [\d.]+/([\d.]+)", out)
+        if m:
+            return float(m.group(1))
+    except Exception:
+        return None
+    return None
+
+def probe_host(host: str) -> Tuple[Optional[float], Optional[float], str]:
+    """
+    Probes host latency using ping_subprocess (or ping3 if available).
+    Returns: (sub_ms, ping3_ms, final_status)
+    final_status in {'good','warn','bad'}
+    """
+    sub = ping_subprocess(host, count=2)
+    ms_candidate = sub if sub is not None else None
+
+    if ms_candidate is None:
+        status = "bad"
+    elif ms_candidate < 150:
+        status = "good"
+    elif ms_candidate < 300:
+        status = "warn"
+    else:
+        status = "bad"
+    return sub, None, status
+
+# -------------------- fragment builder --------------------
+def strip_protocol(link: str) -> str:
+    if "://" in link:
+        return link.split("://", 1)[1]
+    return link
+
+def build_fragment_v2(parsed: Dict[str,Any], ping_info: Optional[Tuple[str,Optional[float]]] = None) -> Optional[Dict[str,Any]]:
+    """
+    Improved fragment builder (v2): richer TLS / WS / gRPC fields, optional mux metadata,
+    keeps remark exact, and includes ping information under meta.
+    """
+    if not parsed:
+        return None
+    proto = parsed.get("protocol","unknown")
+    address = parsed.get("address","0.0.0.0")
+    port = parsed.get("port",443)
+    remark = parsed.get("remark") or parsed.get("raw") or f"{proto}"
+    params = parsed.get("params") or {}
+
+    if not isinstance(address, str) or not address:
+        address = parsed.get("raw","0.0.0.0")
+
+    network = (params.get("type") or params.get("network") or params.get("net") or ("ws" if proto in ("vless","vmess","trojan") else "tcp")).lower()
+    security = params.get("security") or ("tls" if params.get("tls") in ("tls","true","1") else "none")
+
+    stream = {"network": network, "security": security, "sockopt": {"dialerProxy": "fragment", "tcpNoDelay": True}}
+    if network == "ws":
+        path = params.get("path") or params.get("ws-path") or "/"
+        host_hdr = params.get("host") or params.get("sni") or address
+        stream["wsSettings"] = {"path": path, "headers": {"Host": host_hdr}}
+    elif network == "grpc":
+        svc = params.get("serviceName") or params.get("service") or ""
+        stream["grpcSettings"] = {"serviceName": svc, "multiMode": False}
+    elif network in ("h2","http"):
+        stream["httpSettings"] = {"path": params.get("path","/"), "host": [params.get("host") or address]}
+
+    if security in ("tls","xtls"):
+        sni = params.get("sni") or params.get("host") or address
+        fp = params.get("fp") or params.get("fingerprint") or "chrome"
+        alpn = [p.strip() for p in (params.get("alpn") or "").split(",") if p.strip()] or ["http/1.1"]
+        stream["tlsSettings"] = {"serverName": sni, "fingerprint": fp, "alpn": alpn}
+
+    if proto in ("vless","vmess"):
+        users = [{"id": parsed.get("user") or parsed.get("id",""), "encryption": params.get("encryption","none"), "flow": params.get("flow","")}]
+        outbound = {"tag":"proxy","protocol":proto,"settings":{"vnext":[{"address":address,"port":int(port),"users":users}]},"streamSettings":stream}
+    elif proto == "trojan":
+        outbound = {"tag":"proxy","protocol":"trojan","settings":{"servers":[{"address":address,"port":int(port),"password":parsed.get("user","") or parsed.get("id","") }]},"streamSettings":stream}
+    elif proto == "ss":
+        method = parsed.get("method") or params.get("method") or "aes-128-gcm"
+        passwd = parsed.get("user","")
+        outbound = {"tag":"proxy","protocol":"shadowsocks","settings":{"servers":[{"address":address,"port":int(port),"method":method,"password":passwd}]},"streamSettings":{"network":network if network else "tcp","security":"none","sockopt":{"dialerProxy":"fragment"}}}
+    else:
+        return None
+
+    fragment = {
+        "remarks": remark,
+        "log": {"loglevel":"warning", "access":"", "error":""},
+        "dns": {"servers":[{"address":"https://1.1.1.1/dns-query","tag":"remote-dns"},"1.1.1.1","8.8.8.8"], "queryStrategy":"UseIP"},
+        "inbounds": [
+            {"port":10808,"protocol":"socks","settings":{"auth":"noauth","udp":True,"userLevel":8},"tag":"socks-in","sniffing":{"destOverride":["http","tls"],"enabled":True,"routeOnly":True}},
+            {"port":10853,"protocol":"dokodemo-door","settings":{"address":"1.1.1.1","network":"tcp,udp","port":53},"tag":"dns-in"}
+        ],
+        "outbounds": [
+            outbound,
+            {"tag":"fragment","protocol":"freedom","settings":{"fragment":{"packets":"tlshello","length":"100-200","interval":"1-1"},"domainStrategy":"UseIPv4v6"}},
+            {"tag":"dns-out","protocol":"dns","settings":{}}
+        ],
+        "routing": {"domainStrategy":"IPIfNonMatch","rules":[
+            {"inboundTag":["dns-in"], "outboundTag":"dns-out", "type":"field"},
+            {"network":"tcp", "outboundTag":"proxy", "type":"field"},
+            {"network":"udp", "outboundTag":"proxy", "type":"field"}
+        ]},
+        "meta": {"builder":"v2"}
+    }
+
+    if ping_info:
+        fragment["meta"]["ping_status"] = ping_info[0]
+        fragment["meta"]["ping_ms"] = ping_info[1]
+
+    return fragment
+# -------------------- Combo generators --------------------
+def generate_combo2(configs: list[str], cap: int = 50) -> list[str]:
+    n = len(configs)
+    if n < 2:
+        return []
+    indices = [(i,j) for i in range(n) for j in range(i+1,n)]
+    random.shuffle(indices)
+    combos=[]
+    seen=set()
+    for i,j in indices:
+        combo=f"{configs[i]}+{configs[j]}"
+        if combo not in seen:
+            combos.append(combo)
+            seen.add(combo)
+        if len(combos) >= cap:
+            break
+    return combos
+
+def generate_combo3(configs: list[str], cap: int = 50) -> list[str]:
+    n = len(configs)
+    if n < 3:
+        return []
+    cands=[]
+    for a in range(n):
+        for b in range(a+1,n):
+            for c in range(b+1,n):
+                cands.append((a,b,c))
+                if len(cands) >= cap*8:
+                    break
+            if len(cands) >= cap*8:
+                break
+        if len(cands) >= cap*8:
+            break
+    random.shuffle(cands)
+    combos=[]
+    seen=set()
+    for i,j,k in cands:
+        A=configs[i]; B=configs[j]; C=configs[k]
+        tail=strip_protocol(C)
+        combo=f"{A}+{B}+ss//{tail}"
+        if combo in seen:
+            continue
+        seen.add(combo)
+        combos.append(combo)
+        if len(combos) >= cap:
+            break
+    return combos
+
+# -------------------- main --------------------
+def main():
+    all_configs = []
+
+    print("[cyan]Choose input method:[/cyan]")
+    print("1) Manual input (Ctrl+D to finish)")
+    print("2) Fetch from subscription URL")
+    choice = input("Enter choice (1 or 2): ").strip()
+
+    if choice == "1":
+        print("[cyan]Paste your configs line by line. Press Ctrl+D to finish:[/cyan]")
+        try:
+            while True:
+                line = input()
+                if line.strip():
+                    all_configs.append(line.strip())
+        except EOFError:
+            pass
+    elif choice == "2":
+        while True:
+            url = input("Enter subscription URL: ").strip()
+            data = fetch_sub_link(url)
+            if data:
+                new_cfgs = parse_configs(data)
+                all_configs.extend(new_cfgs)
+                print(f"[green]✅ Fetched {len(new_cfgs)} configs[/green]")
+            else:
+                print("[red]No configs fetched.[/red]")
+            more = input("Add another link? (y/n): ").strip().lower()
+            if more != "y":
+                break
+    else:
+        print("[red]Invalid choice.[/red]")
+        return
+
+    # Deduplicate
+    seen = set()
+    deduped = []
+    for c in all_configs:
+        if c not in seen:
+            seen.add(c)
+            deduped.append(c)
+    all_configs = deduped
+
+    vless, trojan, ss, others = categorize_configs(all_configs)
+
+    print(f"\n[bold]Total configs:[/bold] {len(all_configs)}")
+    print(f"VLESS: {len(vless)}")
+    print(f"TROJAN: {len(trojan)}")
+    print(f"SHADOWSOCKS: {len(ss)}")
+    print(f"Others: {len(others)}")
+
+    green, yellow, red = [], [], []
+    global ping_results
+    ping_results = {}
+
+    print("\n[bold cyan]Performing ping checks...[/bold cyan]")
+    for config in all_configs:
+        host = extract_host(config)
+        if not host:
+            print(f"[red][INVALID] {config}[/red]")
+            continue
+        ping = ping_host(host)
+        status, label = classify_ping(ping)
+        ping_results[config] = (status, ping)
+        print(f"{label} {host} - {ping if ping is not None else 'NO REPLY'}ms")
+        if status == "good":
+            green.append(config)
+        elif status == "warn":
+            yellow.append(config)
+        else:
+            red.append(config)
+
+    print("\n[bold]Ping Summary:[/bold]")
+    print(f"[green]GREEN:[/green] {len(green)}")
+    print(f"[yellow]YELLOW:[/yellow] {len(yellow)}")
+    print(f"[red]RED:[/red] {len(red)}")
+
+    folder = "/storage/emulated/0/Download/Akbar98"
+    os.makedirs(folder, exist_ok=True)
+
+    while True:
+        print("\nChoose output to save:")
+        print("1) Green configs")
+        print("2) Green + Yellow configs")
+        print("3) All configs")
+        print("4) Fragmented Config (V2Ray)")
+        print("5) Raw JSON (parsed)")
+        print("6) Combo-2 (2 configs)")
+        print("7) Combo-3 (3 configs)")
+        print("0) Exit")
+        choice = Prompt.ask("Enter choice number", choices=[str(i) for i in range(0,8)])
+
+        if choice == "0":
+            print("[bold green]Exiting...[/bold green]")
+            break
+
+        if choice == "1":
+            data_to_save = green
+            default_name = "green_configs"
+        elif choice == "2":
+            data_to_save = green + yellow
+            default_name = "green_yellow"
+        elif choice == "3":
+            data_to_save = all_configs
+            default_name = "all_configs"
+        elif choice == "4":
+            targets = green + yellow if (green + yellow) else all_configs
+            parsed_list = []
+            for conf in targets:
+                parsed = parse_config(conf)
+                if not parsed:
+                    continue
+                st, pg = ping_results.get(conf, (None, None))
+                fragment = build_fragment_v2(parsed, ping_info=(st, pg))
+                if fragment:
+                    parsed_list.append(fragment)
+            fname = Prompt.ask("Enter filename for Fragment (without extension)", default="fragments")
+            outpath = os.path.join(folder, fname + ".json")
+            save_json(outpath, parsed_list)
+            continue
+        elif choice == "5":
+            parsed_out = []
+            for conf in all_configs:
+                parsed = parse_config(conf)
+                if not parsed:
+                    continue
+                st, pg = ping_results.get(conf, (None, None))
+                parsed["ping"] = pg
+                parsed["status"] = st
+                parsed_out.append(parsed)
+            fname = Prompt.ask("Enter filename for JSON (without extension)", default="parsed_configs")
+            outpath = os.path.join(folder, fname + ".json")
+            save_json(outpath, parsed_out)
+            continue
+        elif choice == "6":
+            combos = generate_combo2(all_configs)
+            fname = Prompt.ask("Enter filename for Combo-2 (without extension)", default="combo2")
+            outpath = os.path.join(folder, fname + ".txt")
+            save_to_file(outpath, combos)
+            continue
+        elif choice == "7":
+            combos = generate_combo3(all_configs)
+            fname = Prompt.ask("Enter filename for Combo-3 (without extension)", default="combo3")
+            outpath = os.path.join(folder, fname + ".txt")
+            save_to_file(outpath, combos)
+            continue
+        else:
+            print("[red]Invalid option.[/red]")
+            continue
+
+        fname = Prompt.ask("Enter filename (without extension)", default=default_name)
+        outpath = os.path.join(folder, fname + ".txt")
+        save_to_file(outpath, data_to_save)
+
+if __name__ == "__main__":
+    main()

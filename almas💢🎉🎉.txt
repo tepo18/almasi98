@@ -1,0 +1,103 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import subprocess, sys, os, random
+
+# 馃帹 Colors (7-color palette)
+COLORS = [
+    "\033[91m",  # Red
+    "\033[92m",  # Green
+    "\033[93m",  # Yellow
+    "\033[94m",  # Blue
+    "\033[95m",  # Magenta
+    "\033[96m",  # Cyan
+    "\033[97m",  # White
+]
+RESET = "\033[0m"
+
+# 鈿欙笍 Main file names (with your requested change)
+main_names = [
+    "max",     # 1 (new)
+    "vip",    # 2
+    "pin",    # 3
+    "clash",   # 4
+]
+
+def colorize(text):
+    """Return text in a random color"""
+    return f"{random.choice(COLORS)}{text}{RESET}"
+
+def show_main_menu():
+    """Display the first main menu (4 options)"""
+    print(colorize("\n馃寛 Select main target file:"))
+    for i, name in enumerate(main_names, start=1):
+        color = COLORS[(i - 1) % len(COLORS)]
+        print(f"{color}{i}. {name}{RESET}")
+    print(f"{COLORS[0]}0. Exit{RESET}")
+
+def show_sub_menu(base_name):
+    """Display the sub-menu for file versions"""
+    print(colorize(f"\n馃搧 Select version for {base_name}:"))
+    print(f"{COLORS[2]}0. {base_name}.py{RESET}")
+    for i in range(1, 26):
+        color = COLORS[i % len(COLORS)]
+        print(f"{color}{i}. {base_name}{i}.py{RESET}")
+    print(f"{COLORS[0]}99. Back{RESET}")
+
+def run_script(filename):
+    """Run the selected Python file using subprocess"""
+    if os.path.isfile(filename):
+        print(colorize(f"\n馃殌 Running {filename} ...\n"))
+        cmd = f"{sys.executable} \"{filename}\" || true"
+        subprocess.run(cmd, shell=True)
+    else:
+        print(colorize(f"鉂� File {filename} not found."))
+
+def main():
+    """Main control flow"""
+    while True:
+        show_main_menu()
+        try:
+            ch = int(input(colorize("Enter number: ")))
+        except ValueError:
+            print(colorize("鈿狅笍 Enter a valid number."))
+            continue
+
+        if ch == 0:
+            print(colorize("馃憢 Exiting..."))
+            break
+
+        if 1 <= ch <= len(main_names):
+            base_name = main_names[ch - 1]
+            while True:
+                show_sub_menu(base_name)
+                try:
+                    sub = int(input(colorize("Enter file number: ")))
+                except ValueError:
+                    print(colorize("鈿狅笍 Enter a valid number."))
+                    continue
+
+                if sub == 99:
+                    break
+
+                if sub == 0:
+                    filename = f"{base_name}.py"
+                elif 1 <= sub <= 25:
+                    filename = f"{base_name}{sub}.py"
+                else:
+                    print(colorize("馃毇 Invalid number"))
+                    continue
+
+                # Run the selected file
+                run_script(filename)
+
+                # After execution, return directly to main menu
+                print(colorize("\n鉁� Execution finished. Returning to main menu...\n"))
+                break  # Go back to main menu immediately
+        else:
+            print(colorize("馃毇 Invalid number."))
+
+if __name__ == "__main__":
+    main()
+
+
