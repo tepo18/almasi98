@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import os
+import shutil
+from datetime import datetime
+from rich.console import Console
+from rich.prompt import Prompt
+from rich.table import Table
+
+console = Console()
+
+BASE_BACKUP_DIR = "/storage/emulated/0/Download/akbar98"
+TERMUX_HOME = "/data/data/com.termux/files/home"
+
+os.makedirs(BASE_BACKUP_DIR, exist_ok=True)
+
+def backup_selected(exts=(".py", ".sh")):
+    """بکاپ گرفتن از تمام فایل‌های py و sh در کل home"""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_dir = os.path.join(BASE_BACKUP_DIR, f"backup_{timestamp}")
+    os.makedirs(backup_dir, exist_ok=True)
+
+    count = 0
+    for root, dirs, files in os.walk(TERMUX_HOME):
+        rel_path = os.path.relpath(root, TERMUX_HOME)
+        dest_dir = os.path.join(backup_dir, rel_path) if rel_path != "." else backup_dir
+        os.makedirs(dest_dir, exist_ok=True)
+        for f in files:
+            if f.endswith(exts):
+                shutil.copy(os.path.join(root, f), dest_dir)
+                count += 1
+
+    console.print(f"[bold green]✅ Backup completed![/bold green] [cyan]{count} files[/cyan] copied to [magenta]{backup_dir}[/magenta]")
+
+def backup_all():
+    """بکاپ گرفتن از کل home"""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_dir = os.path.join(BASE_BACKUP_DIR, f"backup_all_{timestamp}")
+    shutil.copytree(TERMUX_HOME, backup_dir, dirs_exist_ok=True)
+    console.print(f"[bold green]✅ Full backup completed![/bold green] All files copied to [magenta]{backup_dir}[/magenta]")
+
+def restore_files():
+    """رستور فایل‌ها"""
+    backups = sorted([d for d in os.listdir(BASE_BACKUP_DIR) if d.startswith("backup_")], reverse=True)
+    if not backups:
+        console.print("[bold red]❌ No backups found![/bold red]")
+        return
+
+    table = Table(title="Available Backups")
+    table.add_column("Number", style="cyan", justify="center")
+    table.add_column("Backup Folder", style="magenta")
+
+    for idx, b in enumerate(backups):
+        table.add_row(str(idx+1), b)
+
+    console.print(table)
+    choice = Prompt.ask("Enter backup number to restore (0 to cancel)", default="0")
+    if choice == "0":
+        console.print("[yellow]Restore cancelled[/yellow]")
+        return
+
+    try:
+        idx = int(choice) - 1
+        backup_dir = os.path.join(BASE_BACKUP_DIR, backups[idx])
+    except (ValueError, IndexError):
+        console.print("[red]Invalid selection[/red]")
+        return
+
+    for root, dirs, files in os.walk(backup_dir):
+        rel_path = os.path.relpath(root, backup_dir)
+        dest_dir = os.path.join(TERMUX_HOME, rel_path) if rel_path != "." else TERMUX_HOME
+        os.makedirs(dest_dir, exist_ok=True)
+        for f in files:
+            shutil.copy(os.path.join(root, f), dest_dir)
+
+    console.print(f"[bold green]✅ Restore completed![/bold green] Files restored from [magenta]{backup_dir}[/magenta]")
+
+def main():
+    while True:
+        console.print("\n[bold yellow]📂 Termux Backup & Restore Menu[/bold yellow]")
+        console.print("[cyan]1[/cyan]: Backup all .py and .sh files (recursive)")
+        console.print("[cyan]2[/cyan]: Restore files from backup")
+        console.print("[cyan]3[/cyan]: Backup ALL files in home")
+        console.print("[cyan]0[/cyan]: Exit")
+
+        choice = Prompt.ask("Enter your choice", default="0")
+        if choice == "1":
+            backup_selected()
+        elif choice == "2":
+            restore_files()
+        elif choice == "3":
+            backup_all()
+        elif choice == "0":
+            console.print("[bold red]Exiting...[/bold red]")
+            break
+        else:
+            console.print("[red]Invalid choice![/red]")
+
+if __name__ == "__main__":
+    main()
